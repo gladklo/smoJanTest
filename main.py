@@ -3,6 +3,103 @@ log_prompts = False
 # Load pdf
 from langchain_community.document_loaders import PyPDFLoader
 
+# ------------------------------------------------------------
+# Bilder holen
+import os
+os.makedirs("extracted_images", exist_ok=True)
+
+import fitz  # PyMuPDF
+from PIL import Image
+import io
+
+file_path = "pdf/nke-10k-2023.pdf"
+pdf = fitz.open(file_path)
+
+all_images = []
+image_metadata = []
+
+for page_num, page in enumerate(pdf, start=1):
+    for img_index, img in enumerate(page.get_images(full=True), start=1):
+        xref = img[0]
+        base_image = pdf.extract_image(xref)
+        image_bytes = base_image["image"]
+        image_ext = base_image["ext"]
+
+        image = Image.open(io.BytesIO(image_bytes))
+
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+        # 🔹 1. kleine Bilder überspringen (Logos, Icons)
+        if image.width < 300 or image.height < 300:
+            continue
+
+        # 🔹 2. Bildgröße normalisieren
+        image.thumbnail((1024, 1024), Image.LANCZOS)
+
+        image_path = f"extracted_images/page_{page_num}_img_{img_index}.png"
+        image.save(image_path, format="PNG", optimize=True)
+
+
+        all_images.append(image)
+
+        image_metadata.append({
+            "page": page_num,
+            "image_index": img_index,
+            "ext": image_ext,
+            "path": image_path  # ✅ DAS FEHLTE
+        })
+
+print(f"Extracted {len(all_images)} images from the PDF")
+
+# Bilder zu Text
+from langchain_core.messages import HumanMessage
+from langchain_ollama import ChatOllama
+
+vision_llm = ChatOllama(
+    model="qwen3-vl:8b",  # oder anderes Vision-Modell
+    temperature=0.0
+)
+
+def describe_image(image_path: str) -> str:
+    prompt = (
+        "Analyze this image carefully.\n"
+        "Describe in detail what information it contains.\n"
+        "If it shows a chart or table, describe trends, numbers and anything that could be relevant. \n" 
+        "Your answer will be embedded in a vector database."
+    )
+
+    response = vision_llm.invoke([
+        HumanMessage(
+            content=[
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": image_path},
+            ]
+        )
+    ])
+
+    return response.content
+
+#text zu langchain doc
+from langchain_core.documents import Document
+
+image_docs = []
+
+for meta in image_metadata:
+    description = describe_image(meta["path"])
+
+    image_docs.append(
+        Document(
+            page_content=description,
+            metadata={
+                "type": "image",
+                "page": meta["page"],
+                "source": "pdf_image"
+            }
+        )
+    )
+
+# ------------------------------------------------------------
+# text holen
 #file_path = "exampletext.pdf"
 file_path = "pdf/nke-10k-2023.pdf"
 
@@ -21,7 +118,6 @@ text_splitter = RecursiveCharacterTextSplitter(
 )
 all_splits = text_splitter.split_documents(docs)
 
-#print(f"The document has {len(all_splits)} chunks.")
 
 # ------------------------------------------------------------
 # Embed
@@ -49,63 +145,89 @@ from langchain_core.vectorstores import InMemoryVectorStore
 # For more store possiilitys see https://docs.langchain.com/oss/python/langchain/knowledge-base#in-memory
 vector_store = InMemoryVectorStore(embeddings)
 
-ids = vector_store.add_documents(documents=all_splits)
+#Text Speichern
+vector_store.add_documents(documents=all_splits)
+
+#Bilder Speichern
+vector_store.add_documents(image_docs)
+
 
 # ------------------------------------------------------------
 # Get correct chunks
 
-prompt = "What finance improvements did Nike have from 2023 to 2022"
+prompt = "What finance improvements did Nike have from 2022 to 2023"
 
 # Example
 results = vector_store.similarity_search_with_score(prompt, k=5)
 
-doc, score = results[0]
-
-for i, (d, s) in enumerate(results, start=1):
-    print(f"\n--- Rank {i} ---")
-    print(f"Score: {s}")
-    print(d.page_content[:300], "...\n\n\n")
-
-print(f"Score: {score}\n")
-print(doc.page_content)
+# ------------------------------------------------------------
+# Print the top-k retrieved chunks with scores
+print("\n--- Top Chunks Used for Answer ---\n")
+for i, (chunk, score) in enumerate(results, start=1):
+    print(f"--- Chunk {i} (Score: {score:.3f}) ---\n")
+    print(chunk.page_content.strip())
+    print("\n" + "-"*80 + "\n")  # Trennlinie für Übersicht
 
 # ------------------------------------------------------------
 # Generate final answer with local LLM (RAG)
 
 from langchain_ollama import ChatOllama
 from langchain_core.messages import SystemMessage, HumanMessage
+from pathlib import Path
 
-# Local generative LLM
-llm = ChatOllama(
-    model="llama3",
-    temperature=0.0  # deterministic, factual answers
-)
+# Chunks zusammenfügen
+def build_simple_context(docs, max_chars: int | None = None) -> str:
+    """
+    Hängt die Dokumente hintereinander, nummeriert sie und (optional) schneidet
+    den Gesamttest nach `max_chars` Zeichen ab.
+    """
+    parts = []
+    for i, (doc, score) in enumerate(docs, start=1):
+        header = f"\n--- Chunk {i} (Score: {score:.3f}) ---\n"
+        parts.append(header + doc.page_content.strip())
 
-# System prompt: instruct the model how to behave
+    full_text = "\n".join(parts)
+
+    if max_chars is not None and len(full_text) > max_chars:
+        # grobe Abschätzung: 1 Zeichen ≈ 0,25 Token → 20 000 Zeichen ≈ 5 000 Token
+        full_text = full_text[:max_chars] + " …(truncated)"
+
+    return full_text
+
+context = build_simple_context(results, max_chars=20_000)
+
 system_prompt = """
-You are a factual question-answering assistant.
+You are a highly accurate, fact-based question-answering assistant.
 
 You will be given:
 - a user question
-- a context chunk extracted from a document
+- a context containing several numbered chunks of text
 
 Rules:
-- Answer ONLY using the information in the provided context.
-- Be concise, precise, and factual.
-- If the answer is a number, return only the number and unit.
-- If the answer cannot be found in the context, say: "The information is not contained in the provided document."
+1. Answer ONLY using information from the provided context.
+2. For every factual statement, cite the source explicitly using the chunk number, e.g., (Chunk 2).
+3. If the answer cannot be found in the context, reply exactly: "The information is not contained in the provided document."
+4. Do not invent or assume any information not present in the context.
+5. Keep your answer concise and focused on the question.
+6. Get as much Information as you can out of the chunks.
 """
 
-# User prompt = question + retrieved chunk
+
 user_prompt = f"""
 Question:
 {prompt}
 
 Context:
-{doc.page_content}
+{context}
 """
 
-# Call the local LLM
+llm = ChatOllama(
+    model="gpt-oss:120b-cloud",   # Cloud‑Variante – kein lokaler Download nötig
+    temperature=0.0,
+    streaming=False,
+)
+
+
 response = llm.invoke(
     [
         SystemMessage(content=system_prompt),
